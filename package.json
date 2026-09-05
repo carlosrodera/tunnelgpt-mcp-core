@@ -36,5 +36,22 @@
   "devDependencies": {
     "@types/node": "22.18.11",
     "typescript": "5.9.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/carlosrodera/tunnelgpt-mcp-core.git"
+  },
+  "homepage": "https://github.com/carlosrodera/tunnelgpt-mcp-core#readme",
+  "bugs": {
+    "url": "https://github.com/carlosrodera/tunnelgpt-mcp-core/issues"
+  },
+  "author": "Carlos Rodera (https://github.com/carlosrodera)",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "filesystem",
+    "local-first",
+    "typescript",
+    "tunnelgpt"
+  ]
 }
