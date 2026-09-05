@@ -1,0 +1,38 @@
+[
+  {
+    "name": "@modelcontextprotocol/core",
+    "version": "2.0.0",
+    "license": "MIT",
+    "developmentOnly": false
+  },
+  {
+    "name": "@modelcontextprotocol/server",
+    "version": "2.0.0",
+    "license": "MIT",
+    "developmentOnly": false
+  },
+  {
+    "name": "@types/node",
+    "version": "22.18.11",
+    "license": "MIT",
+    "developmentOnly": true
+  },
+  {
+    "name": "typescript",
+    "version": "5.9.3",
+    "license": "Apache-2.0",
+    "developmentOnly": true
+  },
+  {
+    "name": "undici-types",
+    "version": "6.21.0",
+    "license": "MIT",
+    "developmentOnly": true
+  },
+  {
+    "name": "zod",
+    "version": "4.5.4",
+    "license": "MIT",
+    "developmentOnly": false
+  }
+]
