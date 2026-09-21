@@ -60,11 +60,17 @@ export function applyUnifiedPatch(original: string, patch: string): string {
     const source = original.replace(/\r\n/gu, "\n").split("\n");
     if (hadFinalNewline)
         source.pop();
+    // "" still splits to one phantom element; an empty file has zero lines and
+    // only the -0,0 insertion point is inside its range.
+    const lineCount = original === "" ? 0 : source.length;
     const output: string[] = [];
     let sourceIndex = 0;
     for (const hunk of hunks) {
-        const targetIndex = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
-        if (targetIndex < sourceIndex || targetIndex > source.length) {
+        // `@@ -k,0 @@` inserts AFTER line k, so a zero-count hunk's start is the
+        // insertion index itself, not a 1-based line number. `@@ -0,0 @@` is
+        // the before-line-1 insertion point and lands at index 0 by the same rule.
+        const targetIndex = hunk.oldCount === 0 ? hunk.oldStart : hunk.oldStart - 1;
+        if (targetIndex < sourceIndex || targetIndex > lineCount) {
             throw new TunnelGPTError("CONFLICT", "Patch hunks overlap or target an invalid range.");
         }
         output.push(...source.slice(sourceIndex, targetIndex));
