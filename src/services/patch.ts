@@ -91,34 +91,223 @@ export function applyUnifiedPatch(original: string, patch: string): string {
     output.push(...source.slice(sourceIndex));
     return `${output.join("\n")}${hadFinalNewline ? "\n" : ""}`;
 }
+interface DiffPiece {
+    readonly kind: "context" | "add" | "remove";
+    readonly text: string;
+}
+type DiffFrame =
+    | { readonly kind: "region"; oi: number; oj: number; ni: number; nj: number }
+    | { readonly kind: "emit"; readonly line: string };
+
+/**
+ * Patience anchors: lines occurring exactly once in each middle. Their longest
+ * subsequence ordered consistently on both sides is the split skeleton — every
+ * non-anchor region recurses independently, so two distant edits never merge
+ * into one span of fabricated removals and additions.
+ */
+function diffAnchors(
+    oldLines: readonly string[], oi: number, oj: number,
+    newLines: readonly string[], ni: number, nj: number,
+): [number, number][] {
+    const oldUnique = new Map<string, number>();
+    for (let k = oi; k < oj; k++) oldUnique.set(oldLines[k]!, oldUnique.has(oldLines[k]!) ? -1 : k);
+    const newCount = new Map<string, number>();
+    for (let k = ni; k < nj; k++) newCount.set(newLines[k]!, (newCount.get(newLines[k]!) ?? 0) + 1);
+    const pairs: [number, number][] = [];
+    for (let k = ni; k < nj; k++) {
+        const text = newLines[k]!;
+        const oldIndex = oldUnique.get(text);
+        if (newCount.get(text) === 1 && oldIndex !== undefined && oldIndex >= 0)
+            pairs.push([oldIndex, k]);
+    }
+    pairs.sort((a, b) => a[0] - b[0]);
+    // Longest increasing subsequence over the new-side positions.
+    const tails: number[] = [];
+    const prev = new Array<number>(pairs.length).fill(-1);
+    for (let i = 0; i < pairs.length; i++) {
+        const value = pairs[i]![1];
+        let lo = 0, hi = tails.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (pairs[tails[mid]!]![1] < value) lo = mid + 1; else hi = mid;
+        }
+        if (lo > 0) prev[i] = tails[lo - 1]!;
+        if (lo === tails.length) tails.push(i); else tails[lo] = i;
+    }
+    const anchors: [number, number][] = [];
+    for (let i = tails.length === 0 ? -1 : tails[tails.length - 1]!; i >= 0; i = prev[i]!)
+        anchors.push(pairs[i]!);
+    return anchors.reverse();
+}
+
+/** Order-preserving line alignment: context/add/remove runs, no recursion. */
+function diffRuns(oldLines: readonly string[], newLines: readonly string[]): DiffPiece[] {
+    const out: DiffPiece[] = [];
+    const stack: DiffFrame[] = [
+        { kind: "region", oi: 0, oj: oldLines.length, ni: 0, nj: newLines.length },
+    ];
+    while (stack.length > 0) {
+        const frame = stack.pop()!;
+        if (frame.kind === "emit") {
+            out.push({ kind: "context", text: frame.line });
+            continue;
+        }
+        let { oi, oj, ni, nj } = frame;
+        while (oi < oj && ni < nj && oldLines[oi] === newLines[ni]) {
+            out.push({ kind: "context", text: oldLines[oi]! });
+            oi += 1; ni += 1;
+        }
+        let suffix = 0;
+        while (oi + suffix < oj && ni + suffix < nj
+            && oldLines[oj - 1 - suffix] === newLines[nj - 1 - suffix])
+            suffix += 1;
+        const omj = oj - suffix, nmj = nj - suffix;
+        // The suffix is emitted after the middles — push it first (in reverse,
+        // so it pops in order) so LIFO pops it last.
+        for (let k = oj - 1; k >= omj; k--) stack.push({ kind: "emit", line: oldLines[k]! });
+        if (oi === omj) {
+            for (let k = ni; k < nmj; k++) out.push({ kind: "add", text: newLines[k]! });
+            continue;
+        }
+        if (ni === nmj) {
+            for (let k = oi; k < omj; k++) out.push({ kind: "remove", text: oldLines[k]! });
+            continue;
+        }
+        const anchors = diffAnchors(oldLines, oi, omj, newLines, ni, nmj);
+        if (anchors.length === 0) {
+            for (let k = oi; k < omj; k++) out.push({ kind: "remove", text: oldLines[k]! });
+            for (let k = ni; k < nmj; k++) out.push({ kind: "add", text: newLines[k]! });
+            continue;
+        }
+        // Push in reverse so regions pop in document order: trailing region,
+        // then for each anchor backwards its context line and the region
+        // before it.
+        stack.push({
+            kind: "region",
+            oi: anchors[anchors.length - 1]![0] + 1, oj: omj,
+            ni: anchors[anchors.length - 1]![1] + 1, nj: nmj,
+        });
+        for (let a = anchors.length - 1; a >= 0; a--) {
+            stack.push({ kind: "emit", line: oldLines[anchors[a]![0]]! });
+            stack.push({
+                kind: "region",
+                oi: a === 0 ? oi : anchors[a - 1]![0] + 1, oj: anchors[a]![0],
+                ni: a === 0 ? ni : anchors[a - 1]![1] + 1, nj: anchors[a]![1],
+            });
+        }
+    }
+    return out;
+}
+
+const DIFF_CONTEXT = 3;
+
+interface DiffHunk {
+    readonly oldStart: number;
+    readonly oldCount: number;
+    readonly newStart: number;
+    readonly newCount: number;
+    readonly lines: readonly DiffPiece[];
+}
+
+/** Group change runs into hunks; gaps within 2*CONTEXT merge, wider split. */
+function diffHunks(runs: readonly DiffPiece[]): DiffHunk[] {
+    const hunks: DiffHunk[] = [];
+    let oldPos = 1, newPos = 1, i = 0;
+    while (i < runs.length) {
+        let change = i;
+        while (change < runs.length && runs[change]!.kind === "context") change += 1;
+        if (change === runs.length) break;
+        const gap = change - i;
+        const lead = Math.min(gap, DIFF_CONTEXT);
+        oldPos += gap - lead;
+        newPos += gap - lead;
+        const oldStart = oldPos, newStart = newPos;
+        const lines: DiffPiece[] = [];
+        let cursor = change - lead;
+        let closed = false;
+        while (cursor < runs.length) {
+            const piece = runs[cursor]!;
+            if (piece.kind === "context") {
+                let end = cursor;
+                while (end < runs.length && runs[end]!.kind === "context") end += 1;
+                const run = end - cursor;
+                if (end < runs.length && run <= 2 * DIFF_CONTEXT) {
+                    // A narrow unchanged gap merges the surrounding changes
+                    // into one hunk — the shared context would overlap anyway.
+                    for (let k = cursor; k < end; k++) {
+                        lines.push(runs[k]!); oldPos += 1; newPos += 1;
+                    }
+                    cursor = end;
+                    continue;
+                }
+                const trail = Math.min(run, DIFF_CONTEXT);
+                for (let k = cursor; k < cursor + trail; k++) {
+                    lines.push(runs[k]!); oldPos += 1; newPos += 1;
+                }
+                // Resume the scan right after the emitted context: the outer
+                // loop counts the un-emitted remainder as the next hunk's
+                // gap, so its own leading context is still available.
+                i = cursor + trail;
+                closed = true;
+                break;
+            }
+            lines.push(piece);
+            if (piece.kind !== "add") oldPos += 1;
+            if (piece.kind !== "remove") newPos += 1;
+            cursor += 1;
+        }
+        if (!closed) i = runs.length;
+        const oldCount = lines.filter((line) => line.kind !== "add").length;
+        const newCount = lines.filter((line) => line.kind !== "remove").length;
+        hunks.push({
+            // A zero-count header names an insertion point, not a line number:
+            // `@@ -k,0 @@` inserts AFTER line k, so the start is one before the
+            // next unconsumed line.
+            oldStart: oldCount === 0 ? Math.max(0, oldStart - 1) : oldStart,
+            oldCount,
+            newStart: newCount === 0 ? Math.max(0, newStart - 1) : newStart,
+            newCount,
+            lines,
+        });
+    }
+    return hunks;
+}
+
 export function createUnifiedDiff(pathLabel: string, before: string, after: string, maxLines = 200): {
     diff: string;
     truncated: boolean;
     changedLines: number;
 } {
-    const oldLines = before.replace(/\r\n/gu, "\n").split("\n");
-    const newLines = after.replace(/\r\n/gu, "\n").split("\n");
-    let prefix = 0;
-    while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix])
-        prefix += 1;
-    let suffix = 0;
-    while (suffix < oldLines.length - prefix &&
-        suffix < newLines.length - prefix &&
-        oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix])
-        suffix += 1;
-    const oldChanged = oldLines.slice(prefix, oldLines.length - suffix);
-    const newChanged = newLines.slice(prefix, newLines.length - suffix);
+    // Same line model applyUnifiedPatch uses: a trailing newline terminates
+    // the last line rather than starting an empty one, and an empty file has
+    // zero lines — the phantom element would emit a context line the file
+    // does not have.
+    const splitForDiff = (text: string): string[] => {
+        if (text === "") return [];
+        const lines = text.replace(/\r\n/gu, "\n").split("\n");
+        if (text.endsWith("\n")) lines.pop();
+        return lines;
+    };
+    const oldLines = splitForDiff(before);
+    const newLines = splitForDiff(after);
+    const hunks = diffHunks(diffRuns(oldLines, newLines));
+    let changedLines = 0;
     const body = [
         `--- a/${pathLabel}`,
         `+++ b/${pathLabel}`,
-        `@@ -${prefix + 1},${oldChanged.length} +${prefix + 1},${newChanged.length} @@`,
-        ...oldChanged.map((line) => `-${line}`),
-        ...newChanged.map((line) => `+${line}`),
     ];
+    for (const hunk of hunks) {
+        body.push(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`);
+        for (const line of hunk.lines) {
+            body.push(`${line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}${line.text}`);
+            if (line.kind !== "context") changedLines += 1;
+        }
+    }
     const truncated = body.length > maxLines;
     return {
         diff: (truncated ? body.slice(0, maxLines).concat("... diff truncated ...") : body).join("\n"),
         truncated,
-        changedLines: oldChanged.length + newChanged.length,
+        // Only + and - lines are changes; context and headers never count.
+        changedLines,
     };
 }

@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { applyUnifiedPatch } from '../dist/services/patch.js';
+import { applyUnifiedPatch, createUnifiedDiff } from '../dist/services/patch.js';
 import { PathAuthorizer } from '../dist/core/path-authorizer.js';
 import { SafeReader } from '../dist/services/safe-reader.js';
 import { AtomicWriter } from '../dist/services/atomic-writer.js';
@@ -82,4 +82,80 @@ test('writer applies a trailing insertion bound to the expected hash, once', asy
         () => writer.applyPatch({ path: 'probe.txt', patch, expectedHash: sha256('A\nB\n'), confirmationToken: preview.confirmationToken, confirmed: true }),
         (e) => ['PRECONDITION_FAILED', 'CONFLICT'].includes(e.code),
         'replaying a consumed token cannot silently re-apply');
+});
+
+// createUnifiedDiff contract: changedLines counts only +/- lines, distant
+// edits produce separate hunks with bounded context, and the emitted diff
+// applies back to the exact candidate bytes.
+
+test('distant edits produce separate hunks; changedLines excludes context', () => {
+    const before = Array.from({ length: 810 }, (_, i) => `line ${i + 1}`).join('\n');
+    const lines = Array.from({ length: 810 }, (_, i) => `line ${i + 1}`);
+    lines.splice(100, 0, 'INSERTED_A');
+    lines.splice(701, 0, 'INSERTED_B');
+    const after = lines.join('\n');
+    const diff = createUnifiedDiff('Dashboard.tsx', before, after);
+    assert.equal(diff.changedLines, 2, 'two added lines, not the span between them');
+    assert.equal(diff.truncated, false);
+    assert.equal((diff.diff.match(/^@@ /gmu) ?? []).length, 2, 'two hunks, one per site');
+    assert.match(diff.diff, /\+INSERTED_A/u);
+    assert.match(diff.diff, /\+INSERTED_B/u);
+    assert.doesNotMatch(diff.diff, /^-line 200$/mu, 'untouched lines are context, never removals');
+    // The emitted diff applies back to the exact after-bytes.
+    const patch = diff.diff.split('\n').slice(2).join('\n') + '\n';
+    assert.equal(applyUnifiedPatch(before, patch), after, 'emitted hunks round-trip');
+});
+
+test('three distant changes produce three hunks on a large file', () => {
+    const before = Array.from({ length: 5000 }, (_, i) => `row ${i}`).join('\n');
+    const lines = Array.from({ length: 5000 }, (_, i) => `row ${i}`);
+    lines[50] = 'changed-1';
+    lines.splice(2500, 0, 'inserted');
+    lines[4900] = 'changed-3';
+    const after = lines.join('\n');
+    const diff = createUnifiedDiff('big.ts', before, after);
+    assert.equal(diff.changedLines, 5, 'two substitutions and one insertion');
+    assert.equal((diff.diff.match(/^@@ /gmu) ?? []).length, 3);
+    const patch = diff.diff.split('\n').slice(2).join('\n') + '\n';
+    assert.equal(applyUnifiedPatch(before, patch), after);
+});
+
+test('insertion at file start, empty-file insert, and append keep valid headers', () => {
+    const inserted = createUnifiedDiff('f.txt', 'A\nB\n', 'X\nA\nB\n');
+    assert.match(inserted.diff, /@@ -1,\d+ \+1,\d+ @@/u);
+    assert.equal(applyUnifiedPatch('A\nB\n', inserted.diff.split('\n').slice(2).join('\n') + '\n'), 'X\nA\nB\n');
+    const empty = createUnifiedDiff('f.txt', '', 'X\nY');
+    assert.match(empty.diff, /@@ -0,0 \+1,2 @@/u, 'an empty source anchors at -0,0');
+    assert.equal(applyUnifiedPatch('', empty.diff.split('\n').slice(2).join('\n') + '\n'), 'X\nY\n',
+        'applyUnifiedPatch keeps its own newline posture on an empty source');
+    const appended = createUnifiedDiff('f.txt', 'A\nB\n', 'A\nB\nC\n');
+    assert.equal(applyUnifiedPatch('A\nB\n', appended.diff.split('\n').slice(2).join('\n') + '\n'), 'A\nB\nC\n');
+    assert.equal(appended.changedLines, 1);
+});
+
+test('CRLF and Unicode lines diff and apply cleanly', () => {
+    const before = 'línea uno\r\nsegunda línea\r\ntercera\r\n';
+    const after = 'línea uno\r\nsegunda línea\r\n汉字\r\ntercera\r\n';
+    const diff = createUnifiedDiff('doc.txt', before, after);
+    assert.equal(diff.changedLines, 1);
+    const patch = diff.diff.split('\n').slice(2).join('\n') + '\n';
+    assert.equal(applyUnifiedPatch(before, patch), after.replace(/\r\n/gu, '\n'),
+        'applyUnifiedPatch normalizes CRLF to LF — the diff preserves line content');
+});
+
+test('truncation is explicit and the preview count still reflects real changes', () => {
+    const before = Array.from({ length: 400 }, (_, i) => `r${i}`).join('\n');
+    const after = Array.from({ length: 400 }, (_, i) => `r${i} edited`).join('\n');
+    const diff = createUnifiedDiff('all.ts', before, after, 50);
+    assert.equal(diff.truncated, true);
+    assert.ok(diff.diff.endsWith('... diff truncated ...'));
+    assert.equal(diff.changedLines, 800, 'the count reports the real edit size even when truncated');
+    assert.equal(diff.diff.split('\n').length, 51);
+});
+
+test('identical content yields an empty hunk list and zero changes', () => {
+    const diff = createUnifiedDiff('same.txt', 'A\nB\nC\n', 'A\nB\nC\n');
+    assert.equal(diff.changedLines, 0);
+    assert.equal(diff.truncated, false);
+    assert.equal(diff.diff, '--- a/same.txt\n+++ b/same.txt');
 });
