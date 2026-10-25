@@ -2,7 +2,7 @@
 
 One local project folder, file tools and a bounded MCP socket. That is the open-source core.
 
-[![Core checks](https://github.com/carlosrodera/tunnelgpt-mcp-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/carlosrodera/tunnelgpt-mcp-core/actions/workflows/ci.yml)
+[![Core checks](https://github.com/carlosrodera/tunnelgpt-mcp-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/carlosrodera/tunnelgpt-mcp-core/actions/workflows/ci.yml) [![Listed on HookMCP](https://hookmcp.com/badge.svg)](https://hookmcp.com)
 [MIT license](LICENSE) · [TunnelGPT](https://www.tunnelgpt.com) · Built by [Carlos Rodera](https://github.com/carlosrodera)
 
 If you want to wire your own connection instead of using the TunnelGPT application, this package is the starting point: give an MCP client access to **one project directory** over a private Unix socket, with explicit limits on what it can read and change.
